@@ -65,6 +65,7 @@ from hokku.webserver.image_renderer import (
     format_megapixels,
     open_image_for_render,
 )
+from hokku.webserver.labels import LabelError, parse_labels
 from hokku.webserver.mdns import _get_local_ip
 from hokku.webserver.orientation import Orientation
 from hokku.webserver.presets import PRESET_IMAGE_CONFIGS, PRESET_META
@@ -345,7 +346,7 @@ def create_app(
 
         cfg = scheduler.get_screen_config(screen_name)
         pick_orientation = cfg.orientation if cfg.filter_by_orientation else Orientation.NEUTRAL
-        chosen = scheduler.pick_next(orientation=pick_orientation)
+        chosen = scheduler.pick_next(orientation=pick_orientation, labels=frozenset(cfg.labels))
         sleep_seconds = calculate_sleep_seconds(config) if chosen else _busy_retry_seconds(config)
 
         if chosen is None:
@@ -367,6 +368,8 @@ def create_app(
             )
             if converting:
                 msg, status, label = "Converting images, try again shortly", 503, "Converting"
+            elif cfg.labels:
+                msg, status, label = "No images carry this screen's labels", 404, "No labels"
             else:
                 msg, status, label = "No images in upload directory", 404, "No images"
             resp = make_response(msg, status)
@@ -757,6 +760,46 @@ def create_app(
             _request_sync(state)
         return jsonify({"ok": True, "queued": queued})
 
+    @app.route("/hokku/api/labels", methods=["PATCH"])
+    def api_labels_patch():
+        """Edit labels on one or more pictures.
+
+        Body: ``{"names": [...], "labels": [...]}`` replaces each picture's
+        labels, or ``{"names": [...], "add": [...], "remove": [...]}`` adjusts
+        them — the bulk form, where a picture keeps whatever else it had. One
+        route for both keeps the single-picture editor and the multi-select
+        toolbar on the same code path. Nothing is written unless the whole
+        body validates.
+        """
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "expected JSON object"}), 400
+        unknown = body.keys() - {"names", "labels", "add", "remove"}
+        if unknown:
+            return jsonify({"error": f"unknown field(s): {', '.join(sorted(unknown))}"}), 400
+        names = body.get("names")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            return jsonify({"error": "names must be a non-empty list of strings"}), 400
+        if "labels" in body and ("add" in body or "remove" in body):
+            return jsonify({"error": "use either labels or add/remove, not both"}), 400
+
+        try:
+            if "labels" in body:
+                missing = state.manager.set_labels(names, replace_with=parse_labels(body["labels"]))
+            else:
+                missing = state.manager.set_labels(
+                    names,
+                    add=parse_labels(body.get("add", []), field="add"),
+                    remove=parse_labels(body.get("remove", []), field="remove"),
+                )
+        except LabelError as e:
+            logger.info("Labels: rejected %r", str(e))
+            return jsonify({"error": str(e)}), 400
+
+        if missing:
+            logger.info("Labels: %d unknown image(s) skipped", len(missing))
+        return jsonify({"ok": True, "missing": missing})
+
     @app.route("/hokku/api/show_next/<path:name>", methods=["POST"])
     def api_show_next(name: str):
         rec = state.manager.status(name)
@@ -804,7 +847,7 @@ def create_app(
 
     @app.route("/hokku/api/screens/<string:name>/config", methods=["PATCH"])
     def api_screen_config(name: str):
-        """Patch per-screen config (orientation and/or orientation filter)."""
+        """Patch per-screen config (orientation, orientation filter, label filter)."""
         body = request.get_json(silent=True) or {}
         current = state.scheduler.get_screen_config(name)
         updates: dict = {}
@@ -830,6 +873,13 @@ def create_app(
             if not isinstance(val, str):
                 return jsonify({"error": "server_url_override must be a string"}), 400
             updates["server_url_override"] = val.strip()
+
+        if "labels" in body:
+            try:
+                updates["labels"] = parse_labels(body.get("labels"))
+            except LabelError as e:
+                logger.info("Screen config %r: %s", name, e)
+                return jsonify({"error": str(e)}), 400
 
         if updates:
             state.scheduler.set_screen_config(name, replace(current, **updates))
@@ -1051,6 +1101,7 @@ def create_app(
                 "has_image_config_override": r.image_config is not None,
                 "crop_to_fill_threshold": r.crop_to_fill_threshold,
                 "pipeline": _pipeline_label(r, obs),
+                "labels": list(r.labels),
             }
             upload_files.append(entry)
             if r.convert_status == ConvertStatus.FAILED:
@@ -1114,6 +1165,7 @@ def create_app(
                 "orientation": scfg.orientation,
                 "filter_by_orientation": scfg.filter_by_orientation,
                 "server_url_override": scfg.server_url_override,
+                "labels": list(scfg.labels),
                 "last_log": t.last_log or None,
                 "last_log_at": (
                     datetime.fromtimestamp(t.last_log_at).isoformat(timespec="seconds")
@@ -1142,6 +1194,7 @@ def create_app(
                 "upload_files": upload_files,
                 "failed_files": failed_files,
                 "serve_data": serve_data,
+                "labels": manager.all_labels(),
                 "screens": screens_payload,
                 "last_served": last[0] if last else None,
                 "converting": 1 if progress.current_name or progress.done < progress.total else 0,

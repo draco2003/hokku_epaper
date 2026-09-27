@@ -390,7 +390,7 @@ def reference_for(
     reference = {
         "rect": rect,
         "boxes": boxes,
-        "face_full": face_mask(boxes, canvas.shape[:2]),
+        "face_full": face_mask(boxes, (canvas.shape[0], canvas.shape[1])),
         "face": face_mask(boxes, src_lab.shape[:2]),
         "canvas": canvas,
         "src_lab": src_lab,
